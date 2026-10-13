@@ -93,6 +93,12 @@ See [docs/adr/](docs/adr/) for the full records. Headlines:
 | Skill lies about its inputs | Validate all skill inputs/outputs against its declared schema |
 | TTS fails mid-sentence | Log, fall back to a short spoken error or silence — never loop |
 
+## Code pattern
+
+The runtime code follows Ports & Adapters (Hexagonal): the core talks
+only to interfaces, adapters implement them. Details:
+[docs/architecture/code-pattern.md](docs/architecture/code-pattern.md)
+
 ## What this is not
 
 - Not an Alexa/Siri clone. Generic features lose to the vendors.

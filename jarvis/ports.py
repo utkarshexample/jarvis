@@ -2,7 +2,8 @@
 
 A port is a ``typing.Protocol`` -- an interface with no implementation.
 The runtime (the core) only ever talks to ports. The adapters
-(audio.py, wyoming_io.py, brains.py, skills.py) implement them.
+(audio.py, wyoming_io.py, brains.py, skills.py, wakeword.py) implement
+them.
 
 Why this matters: swapping a part means writing a new class that
 satisfies the same port. The core never changes. That is what makes
@@ -15,12 +16,15 @@ Audio contract (shared by every audio adapter):
   mono (``channels=1``), at the given sample rate.
 - Mic / STT side is always 16 kHz (``Config.sample_rate``).
 - Speaker side plays at whatever rate the TTS adapter returns.
+- Streaming frames are 2560 samples (160 ms) at 16 kHz = 5120 bytes:
+  2x the openWakeWord 1280-sample frame, 5x the Silero VAD 512-sample
+  chunk, so one frame feeds both detectors without re-chunking.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterator, Protocol
 
 
 @dataclass(frozen=True)
@@ -38,12 +42,41 @@ class AudioSource(Protocol):
         """Record ``seconds`` of audio, return 16 kHz mono 16-bit PCM."""
         ...
 
+    def stream(self) -> Iterator[bytes]:
+        """Yield 160 ms frames (16 kHz mono 16-bit PCM) until closed.
+
+        The caller closes the iterator (``stream.close()``) when the
+        turn ends. A device stream is infinite; a file stream ends
+        when the file is exhausted.
+        """
+        ...
+
 
 class AudioSink(Protocol):
     """Something that plays raw PCM audio (mouth)."""
 
     def play(self, audio: bytes, rate: int) -> None:
         """Play PCM audio (16-bit mono) sampled at ``rate`` Hz."""
+        ...
+
+
+class WakeWordDetector(Protocol):
+    """Wake word: one frame in, confidence score out."""
+
+    def score(self, frame: bytes) -> float:
+        """Wake word confidence for this 160 ms frame (0.0-1.0).
+
+        The runtime compares it to the configured threshold, so the
+        detector itself holds no threshold.
+        """
+        ...
+
+
+class VAD(Protocol):
+    """Voice activity: one frame in, speech or not."""
+
+    def is_speech(self, frame: bytes) -> bool:
+        """True when this 160 ms frame contains speech."""
         ...
 
 

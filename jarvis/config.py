@@ -22,13 +22,26 @@ Env vars (all optional, all prefixed JARVIS_):
 - JARVIS_AUDIO_OUT_FILE -- output WAV when sink is "file".
 - JARVIS_SKILLS_DIR -- where SKILL.md skill folders live.
 - JARVIS_BRAIN -- "echo" (default, test brain) or "muse" (real brain).
-- JARVIS_BRAIN_SESSION_ID -- side chat for MuseBrain ("jarvis" default).
-  Empty means the main chat.
+- JARVIS_BRAIN_SESSION_ID -- side chat for MuseBrain. Empty (default) =
+  main chat. A side chat needs a UUID (the server rejects other formats),
+  but v1 uses the main chat (see the doc).
+- JARVIS_BRAIN_REPLY_DIR -- where the assistant writes reply files.
+- JARVIS_BRAIN_REPLY_TIMEOUT -- seconds to wait for the reply file (default 120).
 - JARVIS_BRAIN_SOCKET -- musegadget socket path (default: the SDK socket).
 - JARVIS_BRAIN_TIMEOUT -- seconds to wait for a Muse reply (default 90).
 - JARVIS_BRAIN_PERSONA -- persona prompt prepended to each message.
   Unset = default Rick-like persona; "off" = no persona.
 - JARVIS_BRAIN_FALLBACK -- what Jarvis says when the brain is unreachable.
+- JARVIS_WAKE_WORD_ENABLED -- "true" (default) gates turns on "Hey Jarvis".
+  "false" = always-listening (old behaviour).
+- JARVIS_WAKE_WORD_MODEL -- openWakeWord model name (default "hey_jarvis").
+- JARVIS_WAKE_WORD_THRESHOLD -- detection score 0.0-1.0 (default 0.10,
+  tuned: his 'Hey Jarvis' scores ~0.30, background ~0.17). Raise if false
+  positives, lower if it misses.
+- JARVIS_VAD_SILENCE_S -- silence after speech that ends the utterance (default 1.0).
+- JARVIS_LISTEN_MAX_S -- cap on one utterance (default 30).
+- JARVIS_DEBUG -- "true" = detailed [DEBUG] log lines (state transitions,
+  wake word score + heartbeat, VAD events, per-stage timings). Default off.
 """
 
 from __future__ import annotations
@@ -57,11 +70,21 @@ class Config:
     skills_dir: str = "skills"
     skills_dir: str = "skills"
     brain: str = "echo"
-    brain_session_id: str = "jarvis"
+    brain_session_id: str = ""
     brain_socket: str = ""
     brain_timeout: float = 90.0
     brain_persona: str | None = None
+    brain_reply_dir: str = "/tmp/jarvis-replies"
+    brain_reply_timeout: float = 120.0
     brain_fallback: str = "Sorry, I could not reach my brain right now."
+    brain_fallback: str = "Sorry, I could not reach my brain right now."
+    wake_word_enabled: bool = True
+    wake_word_model: str = "hey_jarvis"
+    wake_word_threshold: float = 0.10  # tuned: his 'Hey Jarvis' scores ~0.30, background ~0.17
+    vad_silence_s: float = 1.0
+    listen_max_s: float = 30.0
+    listen_max_s: float = 30.0
+    debug: bool = False
 
     @property
     def stt_uri(self) -> str:
@@ -94,6 +117,9 @@ class Config:
             except ValueError:
                 return default
 
+        def _bool(name: str, default: bool) -> bool:
+            return env.get(name, str(default)).strip().lower() in ("1", "true", "yes")
+
         def _float(name: str, default: float) -> float:
             try:
                 return float(env.get(name, default))
@@ -116,10 +142,18 @@ class Config:
             audio_out_file=env.get("JARVIS_AUDIO_OUT_FILE", "/tmp/jarvis-out.wav"),
             skills_dir=env.get("JARVIS_SKILLS_DIR", "skills"),
             brain=env.get("JARVIS_BRAIN", "echo"),
-            brain_session_id=env.get("JARVIS_BRAIN_SESSION_ID", "jarvis"),
+            brain_session_id=env.get("JARVIS_BRAIN_SESSION_ID", ""),
             brain_socket=env.get("JARVIS_BRAIN_SOCKET", ""),
             brain_timeout=_float("JARVIS_BRAIN_TIMEOUT", 90.0),
             brain_persona=env.get("JARVIS_BRAIN_PERSONA"),
+            brain_reply_dir=env.get("JARVIS_BRAIN_REPLY_DIR", "/tmp/jarvis-replies"),
+            brain_reply_timeout=_float("JARVIS_BRAIN_REPLY_TIMEOUT", 120.0),
+            wake_word_enabled=_bool("JARVIS_WAKE_WORD_ENABLED", True),
+            wake_word_model=env.get("JARVIS_WAKE_WORD_MODEL", "hey_jarvis"),
+            wake_word_threshold=_float("JARVIS_WAKE_WORD_THRESHOLD", 0.10),
+            vad_silence_s=_float("JARVIS_VAD_SILENCE_S", 1.0),
+            listen_max_s=_float("JARVIS_LISTEN_MAX_S", 30.0),
+            debug=_bool("JARVIS_DEBUG", False),
             brain_fallback=env.get(
                 "JARVIS_BRAIN_FALLBACK",
                 "Sorry, I could not reach my brain right now.",

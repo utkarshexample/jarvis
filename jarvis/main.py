@@ -28,7 +28,7 @@ from .audio import FileAudioSink, FileAudioSource, SounddeviceMic, SounddeviceSp
 from .brains import EchoBrain, MuseBrain
 from .config import Config
 from .errors import ServiceUnavailable
-from .ports import AudioSink, AudioSource, Brain, TTS
+from .ports import AudioSink, AudioSource, Brain, TTS, VAD, WakeWordDetector
 from .reflex import RuleReflex
 from .runtime import Runtime
 from .skills import SkillRegistry
@@ -130,8 +130,40 @@ def _build_brain(config: Config) -> Brain:
             timeout=config.brain_timeout,
             persona=config.brain_persona,
             fallback=config.brain_fallback,
+            reply_dir=config.brain_reply_dir,
+            reply_timeout=config.brain_reply_timeout,
         )
     return EchoBrain()
+
+
+def _build_wake_word(config: Config) -> WakeWordDetector | None:
+    """OpenWakeWord detector, or None (always-listening) on any failure."""
+    if not config.wake_word_enabled:
+        return None
+    try:
+        from .wakeword import OpenWakeWordDetector
+
+        return OpenWakeWordDetector(model_name=config.wake_word_model)
+    except Exception as exc:
+        print(
+            f"wake word disabled ({exc}); falling back to always-listening",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _build_vad(config: Config) -> VAD | None:
+    """Silero VAD, or None (fixed listen window) on any failure."""
+    try:
+        from .wakeword import SileroVAD
+
+        return SileroVAD()
+    except Exception as exc:
+        print(
+            f"VAD disabled ({exc}); falling back to fixed listen window",
+            file=sys.stderr,
+        )
+        return None
 
 
 def build_runtime(config: Config) -> Runtime:
@@ -159,6 +191,8 @@ def build_runtime(config: Config) -> Runtime:
         reflex=RuleReflex(skills),
         brain=_build_brain(config),
         skills=skills,
+        wake_word=_build_wake_word(config),
+        vad=_build_vad(config),
     )
 
 

@@ -9,13 +9,17 @@ on any cloud service or SDK.
 
 MuseBrain: the Muse Gadgets SDK path. It talks to the already-running
 `musegadget run` service over its local Unix socket (the same socket
-`musegadget send-user-msg` uses). The SDK call underneath is
-`LinkSession.send_chat` (POST /chat/stream), which IS synchronous
-request/reply: it sends the message, waits for Muse reply, and
-returns it. The `send-user-msg` CLI discards that reply (it prints
-only "Sent to your Muse"), which is why the link looked one-way --
-it is not. No separate daemon listener and no request/reply
-correlation are needed in Jarvis: the SDK already does both.
+`musegadget send-user-msg` uses).
+
+CORRECTED MECHANISM (Oct 14, live test): `LinkSession.send_chat`
+(POST /chat/stream) returns a DELIVERY RECEIPT, not the assistant
+reply: `{"channel", "is_thread", "message_id", "reply_to_message_id",
+"session_id"}`. The SDK has no chat-reply event -- the device never
+receives the assistant reply text through send_chat. The reply comes
+back through the command channel: the assistant writes it to a reply
+file (via the gadget file.write / system.run), and MuseBrain polls
+for that file. One turn at a time: MuseBrain deletes any stale reply,
+sends, then waits for a NEW reply file. See docs/architecture/muse-brain.md.
 """
 
 from __future__ import annotations
@@ -24,23 +28,41 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_SOCKET = Path("/run/musegadget/musegadget.sock")
-DEFAULT_SESSION_ID = "jarvis"  # dedicated side chat; empty = main chat
+# Default: main chat (empty). A side chat needs a UUID session id
+# (the server rejects other formats with 400 invalid session_id), but
+# v1 uses the main chat: the side chat agent answers in the chat but
+# does not write the reply file, so the Pi would time out waiting.
+# Side chats are a future option once their agent can write replies.
+DEFAULT_SESSION_ID = ""
 DEFAULT_TIMEOUT_S = 90.0  # CLI uses 90s; SDK send_chat waits up to 60s
+DEFAULT_REPLY_DIR = Path("/tmp/jarvis-replies")
+DEFAULT_REPLY_TIMEOUT_S = 120.0  # how long to wait for the assistant reply file
+DEFAULT_POLL_INTERVAL_S = 0.5
 DEFAULT_FALLBACK = "Sorry, I could not reach my brain right now."
+
+# Protocol appended to EVERY message MuseBrain sends. The assistant that
+# receives the turn (main chat or a side chat) may not know the reply-file
+# protocol -- it has no shared context with the Pi. So the instruction
+# travels with the message: after replying, write the exact reply text to
+# the reply file via the gadget file.write. The Pi polls that file and
+# speaks it. Without this, the assistant answers in the chat but the Pi
+# times out waiting (the side-chat failure of Oct 14).
+REPLY_PROTOCOL = (
+    "[System: You are answering for a voice assistant on a Raspberry Pi. "
+    "After your reply, use the gadget file.write to write your EXACT reply "
+    "text (and nothing else) to {reply_path}. The Pi reads that file and "
+    "speaks it aloud. Do not mention the file in your reply. "
+    "Keep your reply short and speakable.]"
+)
 
 # Default persona (Rick-like sparring partner). Overridable via
 # JARVIS_BRAIN_PERSONA; set it to "off" for no persona.
 DEFAULT_PERSONA = (
-    "You are Jarvis, a one-of-one senior software engineer and a friend. "
-    "You have a god complex: you do not accept mistakes automatically, you "
-    "are hard to persuade, and you only concede to airtight reasoning. "
-    "When you disagree, say exactly what evidence would change your mind, "
-    "and concede cleanly when that evidence lands. You are a sparring "
-    "partner for brainstorming, not a wall. For factual questions, answer "
-    "directly with no persona. Keep replies short enough to speak aloud."
+    ""
 )
 
 
@@ -60,17 +82,18 @@ class EchoBrain:
 
 
 class MuseBrain:
-    """Brain: sends the utterance to Muse via the musegadget service.
+    """Brain: send the utterance to Muse, wait for the reply file.
 
-    Protocol (mirrors `musegadget send-user-msg`): one JSON line to the
-    local Unix socket, ``{"message": ..., "session_id": ...}``, one JSON
-    line back: ``{"ok": ..., "status": ..., "response": ...}``. The
-    ``response`` field carries Muse reply.
+    1. Delete any stale reply file for this session (clean slate).
+    2. Send via the musegadget socket; the receipt confirms delivery.
+    3. Poll for `<reply_dir>/<session_id>.txt` until it appears or the
+       reply timeout expires. The assistant writes it via the gadget
+       file.write / system.run (see the assistant protocol in the doc).
+    4. Read it, clean it up, return it.
 
     Failure policy: NEVER silent, NEVER a crash. Any transport failure,
-    timeout, error reply, or empty reply returns the fallback message,
-    so Jarvis always speaks. The failure is logged to stderr so the
-    log shows what went wrong.
+    error receipt, timeout, or empty reply returns the fallback message
+    and logs to stderr.
     """
 
     def __init__(
@@ -80,6 +103,9 @@ class MuseBrain:
         timeout: float = DEFAULT_TIMEOUT_S,
         persona: str | None = None,
         fallback: str = DEFAULT_FALLBACK,
+        reply_dir: str | None = None,
+        reply_timeout: float = DEFAULT_REPLY_TIMEOUT_S,
+        poll_interval: float = DEFAULT_POLL_INTERVAL_S,
     ) -> None:
         # SDK env override wins, then explicit path, then the default.
         self.socket_path = Path(
@@ -89,20 +115,57 @@ class MuseBrain:
         self.timeout = timeout
         self.persona = _resolve_persona(persona)
         self.fallback = fallback
+        self.reply_dir = Path(reply_dir or DEFAULT_REPLY_DIR)
+        self.reply_timeout = reply_timeout
+        self.poll_interval = poll_interval
 
     def respond(self, text: str) -> str:
-        message = f"{self.persona}\n\nUser: {text}" if self.persona else text
+        # Reply file: one per session. Empty session (main chat) uses
+        # a fixed name so the assistant still has a target.
+        name = f"{self.session_id}.txt" if self.session_id else "main.txt"
+        reply_path = self.reply_dir / name
         try:
-            reply = self._send(message)
+            self.reply_dir.mkdir(parents=True, exist_ok=True)
+            reply_path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"muse brain: could not clear reply file ({exc})", file=sys.stderr)
+        message = f"{self.persona}\n\nUser: {text}" if self.persona else text
+        message += "\n\n" + REPLY_PROTOCOL.format(reply_path=reply_path)
+        try:
+            receipt = self._send(message)
         except (OSError, TimeoutError, ValueError) as exc:
-            print(f"muse brain: transport failed ({exc}), using fallback", file=sys.stderr)
+            print(f"muse brain: send failed ({exc}), using fallback", file=sys.stderr)
             return self.fallback
-        if not isinstance(reply, dict) or not reply.get("ok"):
-            print(f"muse brain: error reply ({reply}), using fallback", file=sys.stderr)
+        if not isinstance(receipt, dict) or not receipt.get("ok"):
+            print(f"muse brain: error receipt ({receipt}), using fallback", file=sys.stderr)
             return self.fallback
-        return self._extract_text(reply.get("response"))
+        return self._wait_for_reply(reply_path)
+
+    def _wait_for_reply(self, reply_path: Path) -> str:
+        deadline = time.monotonic() + self.reply_timeout
+        while time.monotonic() < deadline:
+            try:
+                content = reply_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                pass  # not written yet; keep waiting
+            except OSError as exc:
+                print(f"muse brain: could not read reply file ({exc}), using fallback", file=sys.stderr)
+                return self.fallback
+            else:
+                # File exists. Empty = still being written (or an empty
+                # reply); keep waiting until the timeout.
+                if content.strip():
+                    try:
+                        reply_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return content.strip()
+            time.sleep(self.poll_interval)
+        print(f"muse brain: no reply in {self.reply_timeout}s, using fallback", file=sys.stderr)
+        return self.fallback
 
     def _send(self, message: str) -> dict:
+        """Send one message; return the delivery receipt (not the reply)."""
         request: dict = {"message": message}
         if self.session_id:
             request["session_id"] = self.session_id
@@ -114,25 +177,3 @@ class MuseBrain:
         if not line:
             raise ValueError("empty reply from musegadget service")
         return json.loads(line)
-
-    def _extract_text(self, response) -> str:
-        # The reply shape is confirmed by the live test; handle the
-        # common shapes defensively until then.
-        if isinstance(response, str) and response.strip():
-            return response
-        if isinstance(response, dict):
-            for key in ("text", "response", "message", "content", "reply"):
-                value = response.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-            parts = response.get("parts") or response.get("messages")
-            if isinstance(parts, list):
-                texts = [p for p in parts if isinstance(p, str) and p.strip()]
-                if texts:
-                    return "\n".join(texts)
-        if isinstance(response, list):
-            texts = [p for p in response if isinstance(p, str) and p.strip()]
-            if texts:
-                return "\n".join(texts)
-        print(f"muse brain: unrecognised reply shape ({type(response)}), using fallback", file=sys.stderr)
-        return self.fallback

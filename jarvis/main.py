@@ -25,14 +25,15 @@ import time
 from pathlib import Path
 
 from .audio import FileAudioSink, FileAudioSource, SounddeviceMic, SounddeviceSpeaker
-from .brains import EchoBrain
+from .brains import EchoBrain, MuseBrain
 from .config import Config
 from .errors import ServiceUnavailable
-from .ports import AudioSink, AudioSource
+from .ports import AudioSink, AudioSource, Brain, TTS
 from .reflex import RuleReflex
 from .runtime import Runtime
 from .skills import SkillRegistry
 from .wyoming_io import WyomingSTT, WyomingTTS
+from .remote_tts import FallbackTTS, RemoteTTS
 
 STT_LOG = Path("/tmp/jarvis-stt.log")
 TTS_LOG = Path("/tmp/jarvis-tts.log")
@@ -109,6 +110,30 @@ def stop_services(procs: list[subprocess.Popen]) -> None:
             proc.kill()
 
 
+def _build_tts(config: Config) -> TTS:
+    """Local Piper TTS, or remote-voice-with-local-fallback when configured."""
+    local = WyomingTTS(config.tts_uri)
+    if not config.tts_primary_url:
+        return local
+    return FallbackTTS(
+        RemoteTTS(config.tts_primary_url, timeout=config.tts_primary_timeout),
+        local,
+    )
+
+
+def _build_brain(config: Config) -> Brain:
+    """EchoBrain by default; MuseBrain when JARVIS_BRAIN=muse."""
+    if config.brain == "muse":
+        return MuseBrain(
+            socket_path=config.brain_socket or None,
+            session_id=config.brain_session_id,
+            timeout=config.brain_timeout,
+            persona=config.brain_persona,
+            fallback=config.brain_fallback,
+        )
+    return EchoBrain()
+
+
 def build_runtime(config: Config) -> Runtime:
     """Construct the Runtime with the adapters the config selects."""
     if config.audio_source == "file":
@@ -130,9 +155,9 @@ def build_runtime(config: Config) -> Runtime:
         audio_source=audio_source,
         audio_sink=audio_sink,
         stt=WyomingSTT(config.stt_uri, language=config.stt_language),
-        tts=WyomingTTS(config.tts_uri),
+        tts=_build_tts(config),
         reflex=RuleReflex(skills),
-        brain=EchoBrain(),
+        brain=_build_brain(config),
         skills=skills,
     )
 

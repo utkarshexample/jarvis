@@ -116,8 +116,15 @@ def _build_tts(config: Config) -> TTS:
     if not config.tts_primary_url:
         return local
     return FallbackTTS(
-        RemoteTTS(config.tts_primary_url, timeout=config.tts_primary_timeout),
+        RemoteTTS(
+            config.tts_primary_url,
+            timeout=config.tts_primary_timeout,
+            log=print,
+            debug=config.debug,
+        ),
         local,
+        log=print,
+        debug=config.debug,
     )
 
 

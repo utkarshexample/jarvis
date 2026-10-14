@@ -55,3 +55,7 @@ Pilot: one room, one working voice loop, on a Raspberry Pi 4.
 
 To be decided for our own code (MIT expected). Third-party components keep
 their own licenses — see [SOFTWARE.md](SOFTWARE.md).
+
+
+cd ~/jarvis
+JARVIS_DEBUG=1 JARVIS_BRAIN=muse JARVIS_TTS_PRIMARY_URL=http://100.123.112.57:8001 ~/.venvs/jarvis-runtime/bin/python -u -m jarvis.main

@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import io
 import sys
+import time
 import wave
+from typing import Callable
 
 import httpx
 
@@ -58,36 +60,75 @@ class RemoteTTS:
     """TTS adapter: POSTs text to an HTTP voice service, returns PCM."""
 
     def __init__(
-        self, url: str, timeout: float = 10.0, client: httpx.Client | None = None
+        self,
+        url: str,
+        timeout: float = 10.0,
+        client: httpx.Client | None = None,
+        log: Callable[[str], None] | None = None,
+        debug: bool = False,
     ) -> None:
         self.url = url.rstrip("/")
         self.timeout = timeout
         self._client = client or httpx.Client(timeout=timeout)
+        self._log = log
+        self._debug_flag = debug
+
+    def _debug(self, msg: str) -> None:
+        if self._debug_flag and self._log is not None:
+            self._log(f"[DEBUG] {msg}")
 
     def synthesize(self, text: str) -> tuple[bytes, int]:
+        # "Send data to Rick": the text goes to the Mac RVC API (/speak),
+        # the Rick-voice WAV comes back. Logged so the debug trace shows
+        # exactly what was sent, what came back, and how long it took.
+        self._debug(
+            f"TTS: sending to Rick ({self.url}/speak, {len(text)} chars): "
+            f"{text[:80]!r}{'...' if len(text) > 80 else ''}"
+        )
+        t0 = time.monotonic()
         try:
             resp = self._client.post(f"{self.url}/speak", json={"text": text})
         except httpx.HTTPError as exc:
+            self._debug(f"TTS: Rick unreachable ({exc})")
             raise ServiceUnavailable(
                 f"remote TTS unreachable at {self.url}: {exc}"
             ) from exc
         if resp.status_code != 200:
+            self._debug(f"TTS: Rick returned HTTP {resp.status_code}")
             raise ServiceUnavailable(
                 f"remote TTS error: HTTP {resp.status_code} from {self.url}"
             )
-        return _wav_to_pcm(resp.content)
+        pcm, rate = _wav_to_pcm(resp.content)
+        self._debug(
+            f"TTS: Rick replied ({len(pcm)} bytes PCM, {rate} Hz, "
+            f"in {time.monotonic() - t0:.1f}s)"
+        )
+        return pcm, rate
 
 
 class FallbackTTS:
     """TTS adapter: primary, with automatic fallback on expected failures."""
 
-    def __init__(self, primary, fallback) -> None:
+    def __init__(
+        self,
+        primary,
+        fallback,
+        log: Callable[[str], None] | None = None,
+        debug: bool = False,
+    ) -> None:
         self._primary = primary
         self._fallback = fallback
+        self._log = log
+        self._debug_flag = debug
+
+    def _debug(self, msg: str) -> None:
+        if self._debug_flag and self._log is not None:
+            self._log(f"[DEBUG] {msg}")
 
     def synthesize(self, text: str) -> tuple[bytes, int]:
         try:
             return self._primary.synthesize(text)
         except JarvisError as exc:
+            self._debug(f"TTS: primary failed ({exc}), using fallback (local Piper)")
             print(f"tts fallback: primary failed ({exc}), using fallback", file=sys.stderr)
             return self._fallback.synthesize(text)
